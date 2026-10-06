@@ -1,0 +1,22 @@
+cd ~/Camera/backend
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("app.py")
+s = p.read_text()
+
+# Replace Optional-style union annotations for Python 3.8 compatibility
+s = re.sub(r'\bstr\s*\|\s*None\b', 'Optional[str]', s)
+s = re.sub(r'\bint\s*\|\s*None\b', 'Optional[int]', s)
+s = re.sub(r'\bfloat\s*\|\s*None\b', 'Optional[float]', s)
+s = re.sub(r'\bbool\s*\|\s*None\b', 'Optional[bool]', s)
+
+if 'Optional[' in s and 'from typing import Optional' not in s:
+    s = re.sub(r'(?m)^from __future__ import annotations\s*$',
+               'from __future__ import annotations\nfrom typing import Optional', s, count=1)
+
+p.write_text(s)
+print("Done: app.py updated.")
+PY
+

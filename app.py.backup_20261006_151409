@@ -1,0 +1,260 @@
+"""
+Sunic Camera Monitoring - FastAPI + FFmpeg RTSP-to-HLS backend.
+
+Requirements:
+  Python 3.10+
+  FFmpeg installed and available on PATH
+
+Install:
+  pip install fastapi uvicorn
+
+Run:
+  uvicorn app:app --host 127.0.0.1 --port 8000
+
+Important:
+- Use only cameras you own or are authorized to monitor.
+- Most IP cameras need a username as well as a password. Default username is
+  configurable with CAMERA_USERNAME (defaults to "admin").
+- RTSP paths differ by camera brand/model. Set RTSP_PATH to your camera's path.
+  Example: /Streaming/Channels/101
+- This starter backend is intended for local development, not public exposure.
+"""
+
+from __future__ import annotations
+from typing import Optional, Dict, List, Tuple, Set
+from typing import Optional
+import asyncio
+import ipaddress
+import os
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+
+APP_DIR = Path(__file__).resolve().parent
+HLS_DIR = APP_DIR / "streams"
+HLS_DIR.mkdir(parents=True, exist_ok=True)
+
+FFMPEG = os.getenv("FFMPEG_PATH", "ffmpeg")
+CAMERA_USERNAME = os.getenv("CAMERA_USERNAME", "admin")
+RTSP_PATH = os.getenv("RTSP_PATH", "/Streaming/Channels/101")
+HLS_BASE_URL = os.getenv("HLS_BASE_URL", "http://127.0.0.1:8000/streams")
+ALLOWED_ORIGINS = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+).split(",")
+
+app = FastAPI(title="Sunic Camera Monitoring API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
+
+# In-memory process registry. Camera passwords are not written to disk.
+processes: Dict[str, Dict[str, Any]] = {}
+
+
+class ConnectRequest(BaseModel):
+    ip: str = Field(min_length=1, max_length=253)
+    password: str = Field(min_length=1, max_length=256)
+    # The existing frontend sends only ip/password. These optional fields make
+    # the endpoint usable with cameras whose RTSP details differ.
+    username: Optional[str] = Field(default=None, max_length=128)
+    rtsp_path: Optional[str] = Field(default=None, max_length=256)
+
+    @field_validator("ip")
+    @classmethod
+    def validate_ip(cls, value: str) -> str:
+        value = value.strip()
+        # Restrict to IP literals in this local-monitoring starter to reduce SSRF risk.
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError("Enter a camera IP address, e.g. 192.168.1.100") from exc
+        if not (address.is_private or address.is_link_local):
+            raise ValueError("For safety, connect only to a private/local camera IP.")
+        return value
+
+    @field_validator("rtsp_path")
+    @classmethod
+    def validate_rtsp_path(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value.startswith("/") or "\n" in value or "\r" in value:
+            raise ValueError("RTSP path must start with /")
+        return value
+
+
+def make_rtsp_url(ip: str, username: str, password: str, path: str) -> str:
+    # URL-encode credentials, including special characters such as @ or #.
+    user = quote(username, safe="")
+    secret = quote(password, safe="")
+    return f"rtsp://{user}:{secret}@{ip}:554{path}"
+
+
+def stop_process(camera_id: str) -> None:
+    item = processes.pop(camera_id, None)
+    if not item:
+        return
+    proc: subprocess.Popen | None = item.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    for camera_id in list(processes):
+        stop_process(camera_id)
+
+
+@app.get("/api/health")
+def health() -> Dict[str, str]:
+    if not shutil.which(FFMPEG):
+        return {"status": "error", "detail": "FFmpeg not found. Install FFmpeg and add it to PATH."}
+    return {"status": "ok", "ffmpeg": "available"}
+
+
+@app.post("/api/cameras/connect")
+async def connect_camera(payload: ConnectRequest) -> Dict[str, str]:
+    if not shutil.which(FFMPEG):
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg is not installed or is not available on PATH.",
+        )
+
+    camera_id = str(uuid.uuid4())
+    output_dir = HLS_DIR / camera_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    username = (payload.username or CAMERA_USERNAME).strip()
+    path = payload.rtsp_path or RTSP_PATH
+    rtsp_url = make_rtsp_url(payload.ip, username, payload.password, path)
+
+    playlist = output_dir / "index.m3u8"
+    segment_pattern = str(output_dir / "segment_%03d.ts")
+
+    # Low-latency HLS output. FFmpeg reconnects are handled by the client by
+    # reconnecting to this endpoint if the camera/stream stops.
+    command = [
+        FFMPEG,
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-rtsp_transport", "tcp",
+        "-i", rtsp_url,
+        "-an",
+        "-c:v", "copy",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "6",
+        "-hls_flags", "delete_segments+append_list+independent_segments",
+        "-hls_segment_filename", segment_pattern,
+        str(playlist),
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Could not start FFmpeg: {exc}") from exc
+
+    processes[camera_id] = {
+        "proc": proc,
+        "ip": payload.ip,
+        "output_dir": output_dir,
+        "playlist": playlist,
+    }
+
+    # Wait briefly for FFmpeg to create the HLS playlist, but don't block too long.
+    for _ in range(30):
+        await asyncio.sleep(0.25)
+        if proc.poll() is not None:
+            error = ""
+            try:
+                if proc.stderr:
+                    error = proc.stderr.read(2000)
+            except Exception:
+                pass
+            stop_process(camera_id)
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "FFmpeg could not open this camera stream. Check the camera IP, "
+                    "password, username, RTSP path, and that RTSP is enabled. "
+                    + (error[-700:] if error else "")
+                ),
+            )
+        if playlist.exists() and playlist.stat().st_size > 0:
+            break
+
+    if not playlist.exists():
+        # Keep the process running: some cameras need longer to produce the first
+        # keyframe. The frontend can retry loading the returned playlist.
+        return {
+            "camera_id": camera_id,
+            "status": "starting",
+            "stream_url": f"{HLS_BASE_URL}/{camera_id}/index.m3u8",
+            "message": "Stream process started; waiting for first video segment.",
+        }
+
+    return {
+        "camera_id": camera_id,
+        "status": "connected",
+        "stream_url": f"{HLS_BASE_URL}/{camera_id}/index.m3u8",
+    }
+
+
+@app.delete("/api/cameras/{camera_id}")
+def disconnect_camera(camera_id: str) -> Dict[str, str]:
+    if camera_id not in processes:
+        raise HTTPException(status_code=404, detail="Camera stream not found.")
+    item = processes.get(camera_id)
+    stop_process(camera_id)
+    if item:
+        shutil.rmtree(item["output_dir"], ignore_errors=True)
+    return {"status": "disconnected", "camera_id": camera_id}
+
+
+
+@app.get("/api/cameras")
+def list_cameras() -> List[Dict[str, str]]:
+    result = []
+
+    for camera_id, item in list(processes.items()):
+        proc = item["proc"]
+
+        result.append({
+            "camera_id": camera_id,
+            "ip": item["ip"],
+            "status": "running" if proc.poll() is None else "stopped",
+            "stream_url": (
+                f"{HLS_BASE_URL}/{camera_id}/index.m3u8"
+            ),
+        })
+
+    return result
+
+# Expose HLS playlists and segments to the frontend.
+app.mount("/streams", StaticFiles(directory=HLS_DIR), name="streams")
